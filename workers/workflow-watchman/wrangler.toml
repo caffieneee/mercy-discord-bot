@@ -1,0 +1,31 @@
+# Worker name — deployed as its own worker, separate from the multi-repo
+# `workflow-watchman`, and it only monitors mercy-discord-bot.
+name = "mercy-watchman"
+main = "src/index.js"
+compatibility_date = "2025-04-01"
+
+# The GitHub Personal Access Token (classic with `repo` + `workflow` scopes)
+# used to read workflow runs and dispatch new ones.
+# Set via: wrangler secret put GITHUB_TOKEN
+# Or copy .dev.vars.example -> .dev.vars for local dev.
+
+# Optional Discord webhook for restart/error notifications.
+# Set via: wrangler secret put DISCORD_WEBHOOK_URL
+
+# No cron trigger on purpose: the session workflow queues its own successor run
+# at both ends of every session (see .github/workflows/mercy-bot.yml), so this
+# worker does not restart anything on a timer. Adding a [triggers] crons entry
+# back here would re-introduce a schedule — don't, unless that is the intent.
+
+# Optional token guarding the public dashboard/metrics pages (sent as
+# 'x-watchman-token' header or ?token= query param). Leave unset for open access.
+# Set via: wrangler secret put DASHBOARD_TOKEN
+
+# Optional (recommended): KV namespace holding each repo's restart budget, so the
+# 24h throttle counts ONLY restarts dispatched by this worker. Without it the
+# worker falls back to counting workflow_dispatch runs from the GitHub API (manual
+# retries count against the budget too).
+#   wrangler kv namespace create WATCHMAN_KV
+[[kv_namespaces]]
+binding = "WATCHMAN_KV"
+id = "c92f79db43f8432bb0eb9bf338df8fff"

@@ -1,0 +1,279 @@
+name: Mercy Bot
+
+# Runs on ubuntu-latest. There is no Windows runner and no RDP here: this
+# workflow exists only to keep the Discord bot online.
+#
+# Never scheduled: no `schedule:`/cron trigger on this workflow, now or later.
+#
+# workflow_dispatch is the only trigger. Each run queues its own successor, which
+# waits in the bot-session group and starts the moment this run ends, so the bot
+# stays up 24/7 by chaining rather than by a timer. The successor always runs the
+# default branch, so an experiment on another branch cannot hijack the loop. A
+# session that runs its full keep-alive resets the retry counter; a bot that
+# keeps failing is retried for 5 links, then the chain stops and alerts instead
+# of looping forever (fix whatever broke, then start one run by hand).
+on:
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'session-chain:<n> (automatic) | workflow-watchman | blank if manual'
+        required: false
+        default: ''
+
+concurrency:
+  group: bot-session
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write    # a run queues its own successor
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Checkout bot code
+        uses: actions/checkout@v4
+
+      - name: Queue the next session (early insurance)
+        # Runs before the bot, so a session lost later in the run (dead runner,
+        # cancelled job, timeout) still has a successor waiting. It queues
+        # pessimistically as a retry; the end-of-run step replaces it with a
+        # reset counter when the bot comes up, and `queue: single` keeps exactly
+        # one waiting, never two sessions.
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
+        run: |
+          # Retry state travels in the dispatch input: session-chain:<n> counts
+          # consecutive runs whose bot never came up (blank = manual = 0). The
+          # value is only ever used as a number, never spliced into shell code,
+          # and its digit count is capped so an absurd hand-typed value cannot
+          # overflow the arithmetic below and hard-fail the step before dispatch.
+          n=0
+          if [[ "$TRIGGERED_BY" =~ ^session-chain:([0-9]{1,9})$ ]]; then
+            n="${BASH_REMATCH[1]}"
+          fi
+          max_retries=5
+
+          if (( n + 1 > max_retries )); then
+            echo "Retry budget spent ($n/$max_retries) - not queueing; the end-of-run step reports a stopped chain."
+            exit 0
+          fi
+
+          body="$(jq -n --arg ref "$CHAIN_REF" --arg tb "session-chain:$((n + 1))" \
+            '{ref: $ref, inputs: {triggered_by: $tb}}')"
+
+          for attempt in 1 2 3; do
+            if curl -sS --fail-with-body -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Content-Type: application/json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/mercy-bot.yml/dispatches" \
+              -d "$body"; then
+              echo "Successor queued for $CHAIN_REF (retry $((n + 1))/$max_retries)."
+              exit 0
+            fi
+            echo "::warning::Dispatch attempt $attempt failed."
+            if (( attempt < 3 )); then sleep 15; fi
+          done
+          echo "::error::Could not queue the next session from the insurance step."
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import discord; print(f'discord.py {discord.__version__}')"
+
+      - name: Session metadata
+        run: |
+          # Every session gets a fresh VM, so there is no previous session state
+          # to read. The run number is monotonic and one run is exactly one
+          # session, so it is the honest number.
+          echo "CACHED_RUN_COUNT=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "CACHED_CREATED_AT=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
+          echo "Session: #$GITHUB_RUN_NUMBER | Created: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Start Mercy Bot + Keep Alive
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          MONGO_URL: ${{ secrets.MONGO_URL }}
+          OWNER_IDS: ${{ secrets.OWNER_IDS }}
+          AUTO_SYNC_COMMANDS: "true"
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/bot.log"
+          : > "$log"
+
+          cleanup() {
+            if kill -0 "$BOT_PID" 2>/dev/null; then
+              kill -TERM "$BOT_PID" 2>/dev/null || true
+              for _ in $(seq 1 10); do
+                kill -0 "$BOT_PID" 2>/dev/null || break
+                sleep 1
+              done
+              kill -KILL "$BOT_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          trap 'cleanup; exit 130' INT TERM
+
+          python -u main.py >> "$log" 2>&1 &
+          BOT_PID=$!
+
+          # Readiness: the bot either logs in or it does not. Waiting on the log
+          # instead of a fixed sleep means a fast start is not penalised and a
+          # failing start is reported with the real traceback.
+          ready=false
+          deadline=$((SECONDS + 180))
+          while (( SECONDS < deadline )); do
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              echo "::error::Bot exited before becoming ready"
+              tail -n 200 "$log"
+              exit 1
+            fi
+            if grep -Eq 'Logged in as|Bot ready:' "$log"; then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+
+          if [[ "$ready" != "true" ]]; then
+            echo "::error::Bot did not become ready within 180 seconds"
+            tail -n 200 "$log"
+            exit 1
+          fi
+
+          echo ""
+          echo "======================================="
+          echo "        MERCY BOT READY"
+          echo "======================================="
+          echo "Session #    : ${CACHED_RUN_COUNT:-unknown}"
+          echo "Bot PID      : $BOT_PID"
+          echo "Runtime      : ubuntu-latest / Python 3.12"
+          echo "======================================="
+          echo ""
+
+          # Keep Alive: stream bot output + keep the session open.
+          # 330, not the job's 360-minute cap: installs can take minutes on a
+          # cold cache, and a session that is killed by the cap never reaches the
+          # SESSION_COMPLETE write below, which would make a healthy session
+          # count as a failure link and eventually stop the chain.
+          end=$((SECONDS + 330 * 60))
+          lines=$(wc -l < "$log")
+          while (( SECONDS < end )); do
+            if ! kill -0 "$BOT_PID" 2>/dev/null; then
+              wait "$BOT_PID" && code=0 || code=$?
+              echo "::error::Bot exited unexpectedly (exit code $code)"
+              tail -n 200 "$log"
+              exit 1
+            fi
+
+            total=$(wc -l < "$log")
+            if (( total > lines )); then
+              sed -n "$((lines + 1)),${total}p" "$log"
+              lines=$total
+            fi
+
+            echo "[$(date -u '+%Y-%m-%d %H:%M:%S') UTC] Bot alive (PID $BOT_PID)..."
+            sleep 30
+          done
+
+          # Only a keep-alive that runs its full 330 minutes gets here. That is
+          # the healthy-session signal: the end-of-run chain step resets its
+          # retry counter on it and counts up when it is missing (bot never
+          # started, crashed, or exited early).
+          echo "SESSION_COMPLETE=true" >> "$GITHUB_ENV"
+
+      - name: Upload bot log (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/bot.log
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Queue the next session (session end)
+        # The chain link: starts the next session when this one ends, even if the
+        # bot crashed (`if: always()`). A session that ran its full keep-alive
+        # resets the retry counter; anything else (never started, crashed, exited
+        # early) counts up, and once the budget is spent the chain stops with a
+        # Discord alert rather than restarting a broken bot forever. This is the
+        # bound the old watchman's 8/24h throttle used to provide.
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          n=0
+          if [[ "$TRIGGERED_BY" =~ ^session-chain:([0-9]{1,9})$ ]]; then
+            n="${BASH_REMATCH[1]}"
+          fi
+          max_retries=5
+
+          next=$((n + 1))
+          if [[ "${SESSION_COMPLETE:-}" == "true" ]]; then next=0; fi
+
+          if (( next > max_retries )); then
+            stop_reason="$n sessions in a row ended early or never started"
+          else
+            body="$(jq -n --arg ref "$CHAIN_REF" --arg tb "session-chain:$next" \
+              '{ref: $ref, inputs: {triggered_by: $tb}}')"
+            queued=false
+            for attempt in 1 2 3; do
+              if curl -sS --fail-with-body -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Content-Type: application/json" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/workflows/mercy-bot.yml/dispatches" \
+                -d "$body"; then
+                queued=true
+                break
+              fi
+              echo "::warning::Dispatch attempt $attempt failed."
+              if (( attempt < 3 )); then sleep 15; fi
+            done
+
+            if [[ "$queued" == "true" ]]; then
+              echo "Successor queued for $CHAIN_REF (retry $next/$max_retries)."
+              exit 0
+            fi
+            stop_reason="GitHub refused the dispatch (see the warnings above)"
+          fi
+
+          echo "::error::Session chain stopped: $stop_reason. The bot is down until a run is started."
+          if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
+            payload="$(jq -n --arg c ":warning: **mercy-discord-bot** session chain stopped: $stop_reason. Start a run: https://github.com/$GITHUB_REPOSITORY/actions/workflows/mercy-bot.yml" \
+              '{content: $c}')"
+            if curl -sS --fail-with-body -X POST -H "Content-Type: application/json" \
+              -d "$payload" "$DISCORD_WEBHOOK_URL"; then
+              echo "Discord alert sent."
+            else
+              echo "::warning::Discord alert failed."
+            fi
+          else
+            echo "::warning::WEBHOOK_URL is not set - no Discord alert sent."
+          fi
