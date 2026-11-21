@@ -22,7 +22,7 @@
  * KV binding is required for that count to mean anything.
  */
 
-const OWNER = "vxillannnnnn-hub";
+const OWNER = "iamoxyg3nnn-cloud";
 
 // ===== Per-repo configuration ================================================
 // This worker intentionally monitors ONLY our bot repo — every other repo that
