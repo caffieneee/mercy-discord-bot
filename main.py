@@ -1295,8 +1295,43 @@ def setup_signal_handlers(bot: DiscordBot) -> None:
     else:
         signal.signal(signal.SIGINT, shutdown_handler)
 
+from aiohttp import web
+
+async def start_health_server(bot: 'DiscordBot'):
+    """Lightweight HTTP server on PORT (default 7860 for Hugging Face Spaces)."""
+    port_str = os.getenv("PORT", "7860")
+    try:
+        port = int(port_str)
+    except ValueError:
+        port = 7860
+
+    app = web.Application()
+
+    async def handle_health(request):
+        is_ready = bot.is_ready() if bot else False
+        user_str = str(bot.user) if (bot and bot.user) else "offline"
+        latency = round(bot.latency * 1000, 2) if (bot and bot.latency) else 0
+        status_data = {
+            "status": "online" if is_ready else "starting",
+            "bot": user_str,
+            "guilds": len(bot.guilds) if (bot and is_ready) else 0,
+            "latency_ms": latency
+        }
+        return web.json_response(status_data, status=200 if is_ready else 503)
+
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Health server listening on http://0.0.0.0:{port}")
+    return runner
+
 async def main():
     bot = None
+    health_runner = None
     try:
         setup_directories()
         setup_logging()
@@ -1308,6 +1343,10 @@ async def main():
     try:
         bot = DiscordBot()
         setup_signal_handlers(bot)
+        try:
+            health_runner = await start_health_server(bot)
+        except Exception as e:
+            logging.warning(f"Could not start health server: {e}")
 
         async with bot:
             async def shutdown_checker():
@@ -1318,10 +1357,6 @@ async def main():
                     await asyncio.sleep(1)
 
             async def run_start():
-                # A failed login/gateway error must close the bot: otherwise
-                # `shutdown_checker` polls `is_closed()` forever and the old
-                # gather never returned, hanging the process with no log and
-                # no exit code (the supervisor would wait forever too).
                 try:
                     await bot.start(DISCORD_TOKEN)
                 except BaseException:

@@ -1,0 +1,11 @@
+.git
+.github
+.env
+*.env
+.env.*
+__pycache__/
+*.py[cod]
+logs/
+tests/
+workers/
+.pytest_cache/
