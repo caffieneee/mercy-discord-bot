@@ -28,4 +28,4 @@ compatibility_date = "2025-04-01"
 #   wrangler kv namespace create WATCHMAN_KV
 [[kv_namespaces]]
 binding = "WATCHMAN_KV"
-id = "c92f79db43f8432bb0eb9bf338df8fff"
+id = "135da863ec2645469c7437c19b2046bc"
